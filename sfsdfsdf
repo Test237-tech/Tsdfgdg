@@ -1,0 +1,599 @@
+local GenericNames = {["LocalScript"] = true, ["ModuleScript"] = true}
+local IgnoreNames = {["RbxCharacterSounds"] = true, [""] = true}
+local processed = {}
+local ccount = 1
+if getrawmetatable then
+    local player = game.Players.LocalPlayer
+    local mt = getrawmetatable(game)
+    local oldIndex = mt.__index
+    setreadonly(mt, false)
+    mt.__index = function(self, key)
+        if self == player and key == "Kick" then
+            return function(...) 
+                return nil 
+            end
+        end
+        return oldIndex(self, key)
+    end
+    setreadonly(mt, true)
+else
+end
+
+local plrservice = game:GetService("Players")
+
+if not decompile then
+    game:Shutdown("Your executor lacks a decompile function.")
+    return
+end
+
+local function getServiceSafe(serviceName)
+    local attempts = 0
+    local maxAttempts = 50
+    local service
+    repeat
+        service = pcall(function() return game:GetService(serviceName) end) and game:GetService(serviceName) or nil
+        attempts = attempts + 1
+        if not service then task.wait() end
+    until service or attempts >= maxAttempts
+    return service
+end
+
+local function getPropertySafe(instance, propertyName)
+    local attempts = 0
+    local maxAttempts = 50
+    local property
+    repeat
+        property = pcall(function() return instance[propertyName] end) and instance[propertyName] or nil
+        attempts = attempts + 1
+        if not property then task.wait() end
+    until property or attempts >= maxAttempts
+    return property
+end
+
+local function getScriptPathAndCreateFolders(script)
+    if not script then
+        return nil, nil
+    end
+    local pathParts = {}
+    local current = script
+    while current and current ~= game do
+        table.insert(pathParts, 1, current.Name)
+        current = current.Parent
+    end
+    if #pathParts == 0 then
+        return nil, nil
+    end
+    local fullPath = table.concat(pathParts, "\\")
+    if not baseFolder or type(baseFolder) ~= "string" then
+        baseFolder = "UnknownGame"
+    end
+    local folderPath = baseFolder .. "\\" .. table.concat(pathParts, "\\", 1, #pathParts - 1)
+    local currentFolder = baseFolder
+    local success = true
+    for i, part in ipairs(pathParts) do
+        if i < #pathParts then
+            currentFolder = currentFolder .. "\\" .. part
+            if not isfolder(currentFolder) then
+                local mkSuccess, mkErr = pcall(function() makefolder(currentFolder) end)
+                if not mkSuccess then
+                    success = false
+                    break
+                end
+            end
+        end
+    end
+    if not success then
+        return nil, nil
+    end
+    return fullPath, folderPath
+end
+
+local function initializeServices()
+    local services = {}
+    local replicatedStorage = getServiceSafe("ReplicatedStorage")
+    if replicatedStorage then
+        table.insert(services, {Service = replicatedStorage, Name = "ReplicatedStorage"})
+    end
+
+    local replicatedFirst = getServiceSafe("ReplicatedFirst")
+    if replicatedFirst then
+        table.insert(services, {Service = replicatedFirst, Name = "ReplicatedFirst"})
+    end
+
+    local starterPlayer = getServiceSafe("StarterPlayer")
+    if starterPlayer then
+        local starterPlayerScripts = getPropertySafe(starterPlayer, "StarterPlayerScripts")
+        if starterPlayerScripts then
+            table.insert(services, {Service = starterPlayerScripts, Name = "StarterPlayerScripts"})
+        end
+        local starterCharacterScripts = getPropertySafe(starterPlayer, "StarterCharacterScripts")
+        if starterCharacterScripts then
+            table.insert(services, {Service = starterCharacterScripts, Name = "StarterCharacterScripts"})
+        end
+    end
+
+    local starterGui = getServiceSafe("StarterGui")
+    if starterGui then
+        table.insert(services, {Service = starterGui, Name = "StarterGui"})
+    end
+
+    if getnilinstances then
+        table.insert(services, {Service = nil, Name = "NilInstances", GetDescendants = getnilinstances})
+    end
+
+    return services
+end
+
+local services = {}
+local deletedScripts = {LocalScripts = {}, ModuleScripts = {}}
+local outputtedScripts = {}
+local logQueue = {"Script initialized..."}
+
+local function initializeBaseFolder()
+    local marketplaceService = getServiceSafe("MarketplaceService")
+    if marketplaceService then
+        local success, productInfo = pcall(function() return marketplaceService:GetProductInfo(game.PlaceId) end)
+        if success and productInfo and productInfo.Name then
+            local gameName = productInfo.Name:gsub("[^%w_%-%s]", ""):gsub("%s", "-")
+            baseFolder = gameName
+        else
+            baseFolder = "UnknownGame"
+        end
+    else
+        baseFolder = "UnknownGame"
+    end
+    if not isfolder(baseFolder) then
+        makefolder(baseFolder)
+    end
+end
+local function ensureArchivable(script)
+    if script and not script.Archivable then
+        local oldArchivable = script.Archivable
+        script.Archivable = true
+        return oldArchivable
+    end
+    return nil
+end
+
+local function setupDeletionTracking()
+    services = initializeServices()
+    for _, service in ipairs(services) do
+        local container = service.Service or game
+        local descendants
+        local success = pcall(function()
+            descendants = service.GetDescendants and service.GetDescendants() or container:GetDescendants()
+        end)
+        if success and descendants then
+            for _, script in ipairs(descendants) do
+                if script:IsA("LocalScript") or script:IsA("ModuleScript") then
+                    script.AncestryChanged:Connect(function(_, parent)
+                        if not parent then
+                            local scriptType = script:IsA("LocalScript") and "LocalScripts" or "ModuleScripts"
+                            local oldArchivable = ensureArchivable(script)
+                            local clonedScript = script:Clone()
+                            if clonedScript then
+                                deletedScripts[scriptType][script.Name] = {Script = clonedScript, Source = service.Name}
+                                logQueue[#logQueue + 1] = "Deleted: " .. script.Name .. " (" .. service.Name .. ")"
+                            else
+                                logQueue[#logQueue + 1] = "Failed to clone deleted script: " .. script.Name .. " (" .. service.Name .. ")"
+                            end
+                            if oldArchivable ~= nil then script.Archivable = oldArchivable end
+                        end
+                    end)
+                end
+            end
+        end
+    end
+end
+spawn(setupDeletionTracking)
+
+local me = plrservice.LocalPlayer or plrservice.PlayerAdded:Wait()
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "ScreenGui"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = me:WaitForChild("PlayerGui")
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 800, 0, 700)
+MainFrame.Position = UDim2.new(0.7, 0, 0.7, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+MainFrame.BorderSizePixel = 0
+MainFrame.Parent = ScreenGui
+
+local TitleBar = Instance.new("Frame")
+TitleBar.Size = UDim2.new(1, 0, 0, 30)
+TitleBar.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+TitleBar.BorderSizePixel = 0
+TitleBar.Parent = MainFrame
+
+local TitleText = Instance.new("TextLabel")
+TitleText.Size = UDim2.new(0.8, 0, 1, 0)
+TitleText.Position = UDim2.new(0, 10, 0, 0)
+TitleText.BackgroundTransparency = 1
+TitleText.Text = "Script Dumper         Credit: HisokaScripter"
+TitleText.TextColor3 = Color3.fromRGB(255, 255, 255)
+TitleText.TextSize = 18
+TitleText.Font = Enum.Font.SourceSansBold
+TitleText.TextXAlignment = Enum.TextXAlignment.Left
+TitleText.Parent = TitleBar
+
+local CloseButton = Instance.new("TextButton")
+CloseButton.Size = UDim2.new(0, 30, 0, 30)
+CloseButton.Position = UDim2.new(1, -30, 0, 0)
+CloseButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+CloseButton.Text = "X"
+CloseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseButton.TextSize = 18
+CloseButton.Font = Enum.Font.SourceSansBold
+CloseButton.Parent = TitleBar
+
+local ContentFrame = Instance.new("Frame")
+ContentFrame.Size = UDim2.new(1, -20, 1, -50)
+ContentFrame.Position = UDim2.new(0, 10, 0, 40)
+ContentFrame.BackgroundTransparency = 1
+ContentFrame.Parent = MainFrame
+
+local LogFrame = Instance.new("ScrollingFrame")
+LogFrame.Size = UDim2.new(1, 0, 0.65, 0)
+LogFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+LogFrame.BorderSizePixel = 0
+LogFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+LogFrame.ScrollBarThickness = 8
+LogFrame.Parent = ContentFrame
+
+local logEntries = {}
+local logHeight = 0
+
+local function addLogEntry(text)
+    local color = Color3.fromRGB(200, 200, 200)
+    if text:find("Deleted") then
+        color = Color3.fromRGB(255, 50, 50)
+    elseif text:find("Paused") then
+        color = Color3.fromRGB(255, 150, 50)
+    elseif text:find("Resumed") then
+        color = Color3.fromRGB(50, 200, 50)
+    elseif text:find("Failed") then
+        color = Color3.fromRGB(255, 50, 50)
+    elseif text:find("Deduped") then
+        color = Color3.fromRGB(50, 200, 50)
+    elseif text:find("Already decompiled") then
+        color = Color3.fromRGB(255, 150, 50)
+    end
+
+    local entry = Instance.new("TextLabel")
+    entry.Size = UDim2.new(1, -10, 0, 20)
+    entry.Position = UDim2.new(0, 5, 0, logHeight)
+    entry.BackgroundTransparency = 1
+    entry.Text = text
+    entry.TextColor3 = color
+    entry.TextSize = 14
+    entry.Font = Enum.Font.SourceSans
+    entry.TextXAlignment = Enum.TextXAlignment.Left
+    entry.TextYAlignment = Enum.TextYAlignment.Top
+    entry.TextWrapped = true
+    entry.Parent = LogFrame
+
+    logHeight = logHeight + 20
+    LogFrame.CanvasSize = UDim2.new(0, 0, 0, logHeight)
+    LogFrame.CanvasPosition = Vector2.new(0, logHeight)
+    table.insert(logEntries, entry)
+end
+
+for _, msg in ipairs(logQueue) do
+    addLogEntry(msg)
+end
+
+local ButtonFrame = Instance.new("Frame")
+ButtonFrame.Size = UDim2.new(1, 0, 0.3, 0)
+ButtonFrame.Position = UDim2.new(0, 0, 0.7, 0)
+ButtonFrame.BackgroundTransparency = 1
+ButtonFrame.Parent = ContentFrame
+
+local DumpAllButton = Instance.new("TextButton")
+DumpAllButton.Size = UDim2.new(0.3, 0, 0.45, -5)
+DumpAllButton.Position = UDim2.new(0, 0, 0, 5)
+DumpAllButton.BackgroundColor3 = Color3.fromRGB(50, 100, 200)
+DumpAllButton.Text = "Dump All"
+DumpAllButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+DumpAllButton.TextSize = 16
+DumpAllButton.Font = Enum.Font.SourceSansBold
+DumpAllButton.Parent = ButtonFrame
+
+local DumpDeletedButton = Instance.new("TextButton")
+DumpDeletedButton.Size = UDim2.new(0.3, 0, 0.45, -5)
+DumpDeletedButton.Position = UDim2.new(0.35, 0, 0, 5)
+DumpDeletedButton.BackgroundColor3 = Color3.fromRGB(150, 50, 200)
+DumpDeletedButton.Text = "Dump Deleted - (WIP)"
+DumpDeletedButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+DumpDeletedButton.TextSize = 16
+DumpDeletedButton.Font = Enum.Font.SourceSansBold
+DumpDeletedButton.Parent = ButtonFrame
+
+local ClearButton = Instance.new("TextButton")
+ClearButton.Size = UDim2.new(0.3, 0, 0.45, -5)
+ClearButton.Position = UDim2.new(0.7, 0, 0, 5)
+ClearButton.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
+ClearButton.Text = "Clear Log"
+ClearButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+ClearButton.TextSize = 16
+ClearButton.Font = Enum.Font.SourceSansBold
+ClearButton.Parent = ButtonFrame
+
+local dragging, dragInput, dragStart, startPos
+TitleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPos = MainFrame.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+TitleBar.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement and dragging then
+        local delta = input.Position - dragStart
+        MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+-- Dumper Logic
+local isDumping = false
+local isPaused = false
+local currentDumpType = nil
+
+local function log(message)
+    addLogEntry(message)
+end
+
+local function collectScripts(dumpType)
+    local localScripts, moduleScripts = {}, {}
+    if dumpType == "all" then
+        for _, service in ipairs(services) do
+            local descendants
+            local success = pcall(function()
+                descendants = service.GetDescendants and service.GetDescendants() or service.Service:GetDescendants()
+            end)
+            if success and descendants then
+                for _, v in ipairs(descendants) do
+                    if v:IsA("LocalScript") or v:IsA("ModuleScript") then
+                        local oldArchivable = ensureArchivable(v)
+                        local clonedScript = v:Clone()
+                        if clonedScript then
+                            local fullPath, folderPath = getScriptPathAndCreateFolders(v)
+                            if folderPath and isfolder(folderPath) then
+                                local key = v.Name .. "_" .. tostring(os.clock())
+                                if v:IsA("LocalScript") then
+                                    localScripts[key] = {Script = clonedScript, FullPath = fullPath, FolderPath = folderPath}
+                                else
+                                    moduleScripts[key] = {Script = clonedScript, FullPath = fullPath, FolderPath = folderPath}
+                                end
+                            else
+                                log("Invalid or non-existent folder path for: " .. v.Name .. " (" .. (folderPath or "nil") .. ")")
+                            end
+                        else
+                            log("Failed to clone script: " .. v.Name .. " (" .. service.Name .. ")")
+                        end
+                        if oldArchivable ~= nil then v.Archivable = oldArchivable end
+                    end
+                end
+            end
+        end
+    elseif dumpType == "deleted" then
+        for name, data in pairs(deletedScripts.LocalScripts) do
+            if data.Script then
+                local oldArchivable = ensureArchivable(data.Script)
+                local fullPath, folderPath = getScriptPathAndCreateFolders(data.Script)
+                if folderPath and isfolder(folderPath) then
+                    localScripts[name] = {Script = data.Script:Clone(), FullPath = fullPath, FolderPath = folderPath}
+                else
+                    log("Invalid or non-existent folder path for deleted script: " .. name .. " (" .. (folderPath or "nil") .. ")")
+                end
+                if oldArchivable ~= nil then data.Script.Archivable = oldArchivable end
+            else
+                log("Nil script in deleted LocalScripts: " .. name)
+            end
+        end
+        for name, data in pairs(deletedScripts.ModuleScripts) do
+            if data.Script then
+                local oldArchivable = ensureArchivable(data.Script)
+                local fullPath, folderPath = getScriptPathAndCreateFolders(data.Script)
+                if folderPath and isfolder(folderPath) then
+                    moduleScripts[name] = {Script = data.Script:Clone(), FullPath = fullPath, FolderPath = folderPath}
+                else
+                    log("Invalid or non-existent folder path for deleted script: " .. name .. " (" .. (folderPath or "nil") .. ")")
+                end
+                if oldArchivable ~= nil then data.Script.Archivable = oldArchivable end
+            else
+                log("Nil script in deleted ModuleScripts: " .. name)
+            end
+        end
+    end
+    return localScripts, moduleScripts
+end
+
+local function decompileScript(script)
+    local success, output = pcall(function()
+        if script == nil then return "No script provided for decompileScript function" end
+        local bytecode
+        local succ, err = pcall(function()
+            bytecode = getscriptbytecode and getscriptbytecode(script) or "No bytecode"
+        end)
+        if succ == false then
+            return "This is your executor's script"
+        end
+        return bytecode and decompile(script) or "Failed to retrieve bytecode"
+    end)
+    return {Success = success, Output = output or "Decompilation error"}
+end
+
+local marketplaceService = game:GetService("MarketplaceService")
+local success, productInfo = pcall(function() return marketplaceService:GetProductInfo(game.PlaceId) end)
+if success and productInfo and productInfo.Name then
+    local gameName = productInfo.Name:gsub("[^%w_%-%s]", ""):gsub("%s", "-")
+    baseFolder = gameName
+else
+    baseFolder = "UnknownGame"
+end
+initializeBaseFolder()
+
+local function setupFolders()
+    if not baseFolder or type(baseFolder) ~= "string" then
+        baseFolder = "UnknownGame"
+    end
+    if not isfolder(baseFolder) then
+        makefolder(baseFolder)
+    end
+end
+local counter = 1
+local function dumpScripts(scriptTable, folder, scriptType)
+    local dedupeCounter, scriptsFailed, scriptsDone = 0, 0, 0
+    local totalScripts = 0
+    for _ in pairs(scriptTable) do totalScripts = totalScripts + 1 end
+    
+    for name, data in pairs(scriptTable) do
+        if not isDumping then return dedupeCounter, scriptsFailed end
+        while isPaused do task.wait() end
+        
+        if not data or not data.Script or not data.FolderPath then
+            log("Error: Invalid script data for " .. name .. " in " .. scriptType .. " - FolderPath: " .. (data.FolderPath or "nil"))
+            scriptsFailed = scriptsFailed + 1
+            totalScripts = totalScripts - 1
+            continue
+        end
+        
+        if not isfolder(data.FolderPath) then
+            log("Folder path is not valid: " .. data.FolderPath)
+            scriptsFailed = scriptsFailed + 1
+            totalScripts = totalScripts - 1
+            continue
+        end
+        
+        local fullPath = data.FullPath
+        local folderPath = data.FolderPath
+        local baseName = data.Script.Name
+        local fileName = baseName .. "-" .. data.Script.ClassName .. ".lua"
+        local fullFilePath = folderPath .. "\\" .. fileName
+        
+        if GenericNames[baseName] then
+            repeat
+                fileName = baseName .. "_" .. counter .. "-" .. data.Script.ClassName .. ".lua"
+                fullFilePath = folderPath .. "\\" .. fileName
+                counter = counter + 1
+            until not (listfiles(folderPath) and table.find(listfiles(folderPath) or {}, fileName))
+        else
+            local files = listfiles(folderPath) or {}
+            if table.find(files, fileName) then
+                dedupeCounter = dedupeCounter + 1
+                scriptsDone = scriptsDone + 1
+                log("Already decompiled (file exists): " .. baseName .. " (" .. folderPath .. ")")
+                continue
+            end
+        end
+        
+        if processed[fullFilePath] and not GenericNames[baseName] then
+            dedupeCounter = dedupeCounter + 1
+            scriptsDone = scriptsDone + 1
+            log("Already decompiled: " .. baseName .. " (" .. folderPath .. ")")
+        else
+            log("Decompiling: " .. baseName .. " (" .. folderPath .. ")")
+            local result = decompileScript(data.Script)
+            if result.Success then
+                if not outputtedScripts[result.Output] or GenericNames[baseName] then
+                    outputtedScripts[result.Output] = true
+                    local contentWithPath = "-- Full Path: " .. fullFilePath .. "\n" .. result.Output
+                    writefile(fullFilePath, contentWithPath)
+                    processed[fullFilePath] = true
+                    scriptsDone = scriptsDone + 1
+                    log("Dumped: " .. baseName .. " (" .. folderPath .. ")")
+                else
+                    dedupeCounter = dedupeCounter + 1
+                    scriptsDone = scriptsDone + 1
+                    log("Deduped (duplicate output): " .. baseName .. " (" .. folderPath .. ")")
+                end
+            else
+                scriptsFailed = scriptsFailed + 1
+                log("Failed: " .. baseName .. " (" .. folderPath .. ") - " .. result.Output)
+            end
+            local remaining = totalScripts - scriptsDone
+            log(string.format("Progress: %d done, %d left", scriptsDone, remaining))
+        end
+        task.wait()
+    end
+    return dedupeCounter, scriptsFailed
+end
+
+local function tableLength(tbl)
+    local count = 0
+    for _ in pairs(tbl) do count = count + 1 end
+    return count
+end
+
+local function startDump(dumpType, button)
+    if not isDumping then
+        isDumping = true
+        isPaused = false
+        currentDumpType = dumpType
+        button.Text = "Pause"
+        button.BackgroundColor3 = Color3.fromRGB(200, 100, 50)
+        setupFolders()
+        log("Starting " .. (dumpType == "all" and "all scripts" or "deleted scripts") .. " dump...")
+        local localScripts, moduleScripts = collectScripts(dumpType)
+        local lsCount, msCount = tableLength(localScripts), tableLength(moduleScripts)
+        log("LocalScripts: " .. lsCount)
+        log("ModuleScripts: " .. msCount)
+
+        local startTime = os.time()
+        spawn(function()
+            local dedupe1, failed1 = dumpScripts(localScripts, baseFolder, "LocalScripts")
+            if not isDumping then return end
+            log("Dumped LocalScripts")
+            local dedupe2, failed2 = dumpScripts(moduleScripts, baseFolder, "ModuleScripts")
+            if not isDumping then return end
+            log("Dumped ModuleScripts")
+
+            local elapsed = os.time() - startTime
+            log("Finished in: " .. elapsed .. " seconds")
+            log("Failed: " .. (failed1 + failed2))
+            log("Deduped: " .. (dedupe1 + dedupe2))
+            isDumping = false
+            button.Text = dumpType == "all" and "Dump All" or "Dump Deleted"
+            button.BackgroundColor3 = dumpType == "all" and Color3.fromRGB(50, 100, 200) or Color3.fromRGB(150, 50, 200)
+        end)
+    elseif currentDumpType == dumpType then
+        if isPaused then
+            isPaused = false
+            button.Text = "Pause"
+            button.BackgroundColor3 = Color3.fromRGB(200, 100, 50)
+            log("Resumed...")
+        else
+            isPaused = true
+            button.Text = "Resume"
+            button.BackgroundColor3 = Color3.fromRGB(100, 150, 50)
+            log("Paused...")
+        end
+    end
+end
+
+DumpAllButton.MouseButton1Click:Connect(function() startDump("all", DumpAllButton) end)
+DumpDeletedButton.MouseButton1Click:Connect(function() startDump("deleted", DumpDeletedButton) end)
+
+ClearButton.MouseButton1Click:Connect(function()
+    for _, entry in ipairs(logEntries) do
+        entry:Destroy()
+    end
+    logEntries = {}
+    logHeight = 0
+    LogFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    addLogEntry("Log cleared...")
+end)
+
+CloseButton.MouseButton1Click:Connect(function()
+    isDumping = false
+    ScreenGui:Destroy()
+end)
+
+print("Script Dumper loaded in auto-execute")
+initializeBaseFolder()
