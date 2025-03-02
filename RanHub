@@ -1,0 +1,350 @@
+local TeleportService = game:GetService("TeleportService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+--Util Vars
+local ESPMobs = ReplicatedStorage.Storage.Mobs
+local ESPInstances = {} -- Stored in ESPInstances[Instance]=true||False
+local Alive: any = workspace.Alive
+local NoRollCooldown = false
+------------------------------------------------------------------------------------------------------------------------------------------------ ESP Functions
+local function createESP(model)
+    if not model or not model:IsA("Model") or not model:FindFirstChildOfClass("Humanoid") then
+        return nil -- Ensure valid model with humanoid
+    end
+
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    local rootPart = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+    if not rootPart then return nil end
+
+    -- Create Highlight
+    local highlight = Instance.new("Highlight")
+    highlight.Adornee = model
+    highlight.FillTransparency = 0.7
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.OutlineColor = Color3.new(1, 1, 1)
+    highlight.Parent = model
+
+    -- Create BillboardGui for name and health bar
+    local billboard = Instance.new("BillboardGui")
+    billboard.Adornee = rootPart
+    billboard.Size = UDim2.new(0, 100, 0, 70)
+    billboard.StudsOffset = Vector3.new(0, 4, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Enabled = true
+    billboard.Parent = rootPart
+
+    -- Player Name Label
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(1, 0, 0, 20)
+    nameLabel.Position = UDim2.new(0, 0, 0, 0)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.TextStrokeTransparency = 0
+    nameLabel.Text = model.Name
+    nameLabel.TextColor3 = Color3.new(0.992157, 0, 0)
+    nameLabel.Font = Enum.Font.SourceSansBold
+    nameLabel.TextSize = 14
+    nameLabel.Parent = billboard
+
+    -- Health Label
+    local healthLabel = Instance.new("TextLabel")
+    healthLabel.Size = UDim2.new(1, 0, 0, 20)
+    healthLabel.Position = UDim2.new(0, 0, 0, 20)
+    healthLabel.BackgroundTransparency = 1
+    healthLabel.Text = string.format("%d / %d", humanoid.Health, humanoid.MaxHealth)
+    healthLabel.TextColor3 = Color3.new(1, 1, 1)
+    healthLabel.Font = Enum.Font.SourceSans
+    healthLabel.TextSize = 12
+    healthLabel.Parent = billboard
+
+    -- Conditional color adjustments
+    if model:FindFirstChild("Head") then
+        highlight.FillColor = model.Head.Color
+        highlight.OutlineColor = model.Head.Color
+    end
+    if Players:FindFirstChild(model.Name) then
+        nameLabel.TextColor3 = Color3.new(1.000000, 1.000000, 1.000000)
+        highlight.FillColor = Color3.new(0, 0.180392, 0.992157)
+    end
+
+    -- Health Bar Frame (Vertical)
+    local healthFrame = Instance.new("Frame")
+    healthFrame.Size = UDim2.new(0, 2, 0, 30)
+    healthFrame.Position = UDim2.new(0, 0, 0, 0) -- Adjusted X to positive offset within bounds
+    healthFrame.BackgroundColor3 = Color3.fromRGB(50, 50, 50) -- Gray for contrast
+    healthFrame.Parent = billboard
+
+    local healthBar = Instance.new("Frame")
+    local healthPercent = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
+    healthBar.Size = UDim2.new(1, 0, healthPercent, 0)
+    healthBar.Position = UDim2.new(0, 0, 1 - healthPercent, 0)
+    healthBar.BackgroundColor3 = Color3.fromRGB(0, 255, 0)
+    healthBar.BorderSizePixel = 0
+    healthBar.Parent = healthFrame
+
+    -- Update health bar color and size
+    local function updateHealth()
+        local newHealthPercent = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
+        healthBar.Size = UDim2.new(1, 0, newHealthPercent, 0)
+        healthBar.Position = UDim2.new(0, 0, 1 - newHealthPercent, 0)
+        healthLabel.Text = string.format("%d / %d", humanoid.Health, humanoid.MaxHealth)
+        if newHealthPercent <= 0.2 then
+            healthBar.BackgroundColor3 = Color3.fromRGB(255, 0, 0) -- Red
+        elseif newHealthPercent <= 0.8 then
+            healthBar.BackgroundColor3 = Color3.fromRGB(255, 165, 0) -- Orange
+        else
+            healthBar.BackgroundColor3 = Color3.fromRGB(0, 255, 0) -- Green
+        end
+    end
+    -- Connect health changes and ensure initial update
+    humanoid.HealthChanged:Connect(updateHealth)
+    updateHealth()
+    -- Debugging output
+    print("Health bar created for", model.Name, "at", healthFrame.AbsolutePosition, "with size", healthBar.AbsoluteSize)
+    return {
+        Highlight = highlight,
+        Billboard = billboard,
+        Model = model,
+        Connection = humanoid.HealthChanged
+    }
+end
+
+
+local function ToggleESP(model, enabled)
+    if not model then return end
+    if enabled then
+        if ESPInstances[model] == nil then
+            ESPInstances[model] = createESP(model)
+            print("Created ESP", model, ESPInstances[model])
+        end
+    else
+        if ESPInstances[model] then
+            local esp = ESPInstances[model]
+            if esp.Highlight then esp.Highlight:Destroy() end
+            if esp.Billboard then esp.Billboard:Destroy() end
+            ESPInstances[model] = nil
+            warn("Removed ESP", model)
+        end
+    end
+end
+
+local function ClearESP()
+    for model, esp in pairs(ESPInstances) do
+        if esp.Highlight then esp.Highlight:Destroy() end
+        if esp.Billboard then esp.Billboard:Destroy() end
+    end
+    table.clear(ESPInstances)
+end
+
+------------------------------------------------------------------------------------------------------------------------------------------------ Util Functions
+local function getCurrentJobId() 
+    local jobId = game.JobId
+    if jobId and jobId ~= "" then
+        return jobId
+    else
+        warn("Failed to get JobId. This might not work without proper executor permissions.")
+        return nil
+    end
+end
+local function createTeleportCode()
+    local jobId = getCurrentJobId()
+    if jobId then
+        -- Attempt to create a teleport code (requires TeleportService permissions)
+        local success, teleportCode = pcall(function()
+            return TeleportService:ReserveServer(game.PlaceId)
+        end)
+        if success and teleportCode then
+            return teleportCode
+        else
+            warn("Failed to reserve server. Falling back to direct teleport with JobId.")
+            return nil
+        end
+    end
+    return nil
+end
+
+local function GetName(Model)
+    if Players:FindFirstChild(Model.Name) then return Model.Name end
+    local ModelName = Model.Name
+    for i,v in next, ESPMobs:GetChildren() do
+        local MobName = v.Name
+        if #ModelName >= #MobName then
+            if string.sub(ModelName,1,#MobName) == MobName then
+                return MobName
+            end
+        end
+    end
+end
+
+------------------------------------------------------------------------------------------------------------------------------------------------ Main Functions
+local function rejoinSameServer()
+    local jobId = getCurrentJobId()
+    if not jobId then
+        warn("Cannot rejoin: Unable to retrieve JobId.")
+        return
+    end
+    local teleportCode = createTeleportCode()
+    local playersToTeleport = {LocalPlayer}
+    if teleportCode then
+        local success, err = pcall(function()
+            TeleportService:TeleportToPrivateServer(game.PlaceId, teleportCode, playersToTeleport)
+        end)
+        if not success then
+            warn("Teleport failed: " .. (err or "Unknown error"))
+        else
+            print("Attempting to rejoin with reserved server code: " .. teleportCode)
+        end
+    else
+        local success, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, LocalPlayer)
+        end)
+        if not success then
+            warn("Teleport failed: " .. (err or "Unknown error. This method may be blocked by Roblox."))
+        else
+            print("Attempting to rejoin server with JobId: " .. jobId)
+        end
+    end
+end
+
+------------------------------------------------------------------------------------------------------------------------------------------------ Main Gui
+local ReGui = loadstring(game:HttpGet("https://raw.githubusercontent.com/Test237-tech/Tsdfgdg/refs/heads/main/UiLib"))()
+local PrefabsId = `rbxassetid://{ReGui.PrefabsId}`
+ReGui:Init({
+    Prefabs = game:GetService("InsertService"):LoadLocalAsset(PrefabsId)
+})
+
+local EspWindow = ReGui:TabsWindow({
+    Title = "ESP",
+    Size = UDim2.fromOffset(300, 200),
+    Position = UDim2.fromOffset(0, 0),
+    Theme = "DarkTheme"
+})
+local CombatWindow = ReGui:TabsWindow({
+    Title = "Combat",
+    Size = UDim2.fromOffset(300, 200),
+    Position = UDim2.fromOffset(300, 0),
+    Theme = "DarkTheme"
+})
+local MiscWindow = ReGui:Window({
+    Title = "Misc",
+    Size = UDim2.fromOffset(300, 200),
+    Position = UDim2.fromOffset(600, 0),
+    Theme = "DarkTheme"
+})
+
+local MobESPTab = EspWindow:CreateTab({Name = "Mobs"})
+local MobPlayerTabs = EspWindow:CreateTab({Name = "Players"})
+local CombatTab = CombatWindow:CreateTab({Name = "Cooldown"})
+
+local CC = CombatTab:Checkbox({
+    Value = false,
+    Label = "No Roll Cooldown",
+    Callback = function(self,Value)
+        NoRollCooldown = Value
+    end
+})
+
+MiscWindow:Button({
+    Text = "Rejoin Server",
+    Callback = function()
+        rejoinSameServer()
+    end
+})
+
+local CheckBoxedEsp = {}
+local mobChildren = ESPMobs:GetChildren()
+table.sort(mobChildren, function(mobA, mobB)
+    return mobA.Name < mobB.Name
+end)
+for _, mob in ipairs(mobChildren) do
+    local MobName = mob.Name
+    local CheckBox = MobESPTab:Checkbox({
+        Value = false,
+        Label = MobName,
+        Callback = function(self, Value)
+            CheckBoxedEsp[MobName] = Value
+        end
+    })
+    for i,v in next, CheckBox do
+        warn(i,v)
+    end
+end
+local checkBoxes = {}
+for _,Player in next, Players:GetChildren() do
+    local suc, err = pcall(function()
+        local PlayerName = Player.Name
+        local CheckBox
+        CheckBox = MobPlayerTabs:Checkbox({
+            Value = false,
+            Label = PlayerName,
+            Callback = function(self, Value)
+                CheckBoxedEsp[PlayerName] = Value
+                rconsoleprint(PlayerName)
+            end
+        })
+        checkBoxes[Player] = CheckBox
+    end)
+    if err then warn(err) end
+end
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------ ESP Connections
+local BLACK_LISTED = {
+  'CantRoll', 'EatCD', 'KeepBlock', 'Harvesting', 'SheathDash', 'IsRolling', 'RollCD', 'M1CoolDown', 'RunningAttackCD', 'CantRun', 'CantFeint', 'FeintCD', 'FootprintCD', 'Swinging'
+}
+getgenv().con = Players.LocalPlayer.Character.DescendantAdded:Connect(function(instance)
+    if table.find(BLACK_LISTED, instance.Name) and NoRollCooldown then
+        instance:Destroy()
+    end
+end)
+LocalPlayer.CharacterAdded:Connect(function(char)
+    char.DescendantAdded:Connect(function(instance)
+        if table.find(BLACK_LISTED, instance.Name) then
+            instance:Destroy()
+        end
+    end)
+end)
+Players.PlayerAdded:Connect(function(Player)
+    local PlayerName = Player.Name
+    local CheckBox
+    CheckBox = MobPlayerTabs:Checkbox({
+        Value = false,
+        Label = PlayerName,
+        Callback = function(self, Value)
+            CheckBoxedEsp[PlayerName] = Value
+        end
+    })
+    checkBoxes[Player] = CheckBox
+end)
+
+Players.PlayerRemoving:Connect(function(Player)
+    if checkBoxes[Player] then
+        local succ,err = pcall(function()
+            checkBoxes[Player]:Destroy()
+        end)
+        if not succ then
+            warn("Destroy ",err)
+        end
+    else
+        print("No box found")
+    end
+end)
+
+RunService.Heartbeat:Connect(function()
+    for _, model in ipairs(Alive:GetChildren()) do
+        local Master = model:FindFirstChild("Master")
+        if not Master then
+            local ModelName = GetName(model)
+            if ESPInstances[model] == nil then
+                if CheckBoxedEsp[ModelName] then
+                    ToggleESP(model, true)
+                end
+            else
+                if not CheckBoxedEsp[ModelName] then
+                    ToggleESP(model, false)
+                end
+            end
+        end
+    end
+end)
